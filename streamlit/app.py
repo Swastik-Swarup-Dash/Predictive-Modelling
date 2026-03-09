@@ -6,6 +6,7 @@ Real-time predictions, model comparison, and data visualization
 import os
 import sys
 import json
+import time
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -353,8 +354,13 @@ def main():
 
     # API Configuration
     api_url = st.sidebar.text_input("API URL", "http://localhost:8000")
-    refresh = st.sidebar.checkbox("Auto-refresh", value=False)
-    refresh_interval = st.sidebar.slider("Refresh interval (seconds)", 30, 300, 60)
+
+    # Auto-refresh settings
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        refresh = st.checkbox("🔄 Auto", value=False)
+    with col2:
+        interval = st.selectbox("⏱️ Sec", [30, 60, 120, 300], index=1)
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📊 Navigation")
@@ -368,9 +374,7 @@ def main():
 
     # Auto-refresh
     if refresh:
-        import time
-
-        time.sleep(refresh_interval)
+        time.sleep(interval)
         st.rerun()
 
     # Header
