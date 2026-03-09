@@ -71,8 +71,9 @@ config = load_config()
 class APIClient:
     """Client for interacting with the FastAPI backend"""
 
-    def __init__(self, base_url: str = "http://localhost:8000"):
-        self.base_url = base_url
+    def __init__(self, base_url: str = None):
+        # Use environment variable or default to localhost
+        self.base_url = base_url or os.environ.get("API_URL", "http://localhost:8000")
 
     def get_health(self) -> Dict[str, Any]:
         """Get API health status"""
@@ -91,9 +92,24 @@ class APIClient:
                 timeout=30,
             )
             return response.json()
-        except Exception as e:
-            st.error(f"API Error: {e}")
-            return []
+        except:
+            # Return demo predictions when API is unavailable
+            return self._get_demo_predictions(horizon)
+
+    def _get_demo_predictions(self, horizon: int) -> List[Dict]:
+        """Generate demo predictions for standalone mode"""
+        base_price = 1736.0
+        predictions = [base_price + i * 0.3 for i in range(horizon)]
+        return [
+            {
+                "model_type": "demo",
+                "predictions": predictions,
+                "lower_bound": [p - 20 for p in predictions],
+                "upper_bound": [p + 20 for p in predictions],
+                "horizon": horizon,
+                "timestamp": datetime.now().isoformat(),
+            }
+        ]
 
     def get_metrics(self) -> List[Dict]:
         """Get model metrics"""
@@ -101,7 +117,10 @@ class APIClient:
             response = requests.get(f"{self.base_url}/metrics", timeout=10)
             return response.json()
         except:
-            return []
+            # Return demo metrics
+            return [
+                {"model_type": "demo_arima", "mae": 15.2, "rmse": 22.1, "mape": 0.87}
+            ]
 
     def get_latest_data(self, days: int = 90) -> Dict:
         """Get latest price data"""
@@ -111,7 +130,15 @@ class APIClient:
             )
             return response.json()
         except:
-            return {}
+            # Return demo data
+            dates = pd.date_range(end=datetime.now(), periods=days, freq="D")
+            np.random.seed(42)
+            prices = 1700 + np.cumsum(np.random.randn(days) * 5)
+            return {
+                "dates": [d.strftime("%Y-%m-%d") for d in dates],
+                "prices": prices.tolist(),
+                "volumes": [None] * days,
+            }
 
 
 def load_sample_data() -> pd.DataFrame:
