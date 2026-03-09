@@ -245,10 +245,33 @@ async def predict(request: PredictionRequest):
         try:
             model = models[model_type]
 
-            if model_type == "lstm":
-                result = model.predict_with_confidence(data, request.horizon)
+            # Handle both old format (direct model) and new format (dict with 'model' key)
+            if isinstance(model, dict) and "model" in model:
+                actual_model = model["model"]
             else:
-                result = model.predict_with_confidence(request.horizon)
+                actual_model = model
+
+            if model_type == "lstm":
+                result = actual_model.predict_with_confidence(data, request.horizon)
+            elif hasattr(actual_model, "predict_with_confidence"):
+                # ARIMAModel wrapper
+                result = actual_model.predict_with_confidence(request.horizon)
+            else:
+                # Raw pmdarima model
+                forecasts, conf_int = actual_model.predict(
+                    n_periods=request.horizon, return_conf_int=True
+                )
+                result = {
+                    "predictions": forecasts.tolist()
+                    if hasattr(forecasts, "tolist")
+                    else list(forecasts),
+                    "lower_bound": conf_int[:, 0].tolist()
+                    if hasattr(conf_int, "tolist")
+                    else list(conf_int[:, 0]),
+                    "upper_bound": conf_int[:, 1].tolist()
+                    if hasattr(conf_int, "tolist")
+                    else list(conf_int[:, 1]),
+                }
 
             responses.append(
                 PredictionResponse(
