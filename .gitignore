@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+mlruns/
+*.pkl
+*.h5
+.env
+.DS_Store
+*.log
