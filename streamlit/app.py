@@ -36,9 +36,33 @@ CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 
 
 def load_config() -> Dict[str, Any]:
-    """Load configuration"""
-    with open(CONFIG_PATH, "r") as f:
-        return yaml.safe_load(f)
+    """Load configuration with fallback to defaults"""
+    default_config = {
+        "server": {"host": "0.0.0.0", "port": 8000, "workers": 1},
+        "dashboard": {"refresh_interval": 300, "port": 8501},
+        "database": {
+            "host": "localhost",
+            "port": 5432,
+            "name": "gold_forecast",
+            "user": "postgres",
+            "password": "postgres",
+        },
+        "api": {"metalpriceapi_key": ""},
+        "models": {
+            "lstm": {"sequence_length": 60, "layers": 2, "units": 50},
+            "prophet": {},
+            "arima": {},
+        },
+        "training": {"test_size": 0.2, "random_state": 42, "n_splits": 5},
+        "forecast": {"horizon": 30, "confidence_level": 0.95},
+        "monitoring": {"drift_threshold": 0.05, "retrain_frequency": "weekly"},
+    }
+
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        return default_config
 
 
 config = load_config()
