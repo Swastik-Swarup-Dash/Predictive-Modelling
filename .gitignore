@@ -8,3 +8,4 @@ mlruns/
 .env
 .DS_Store
 *.log
+config.yaml

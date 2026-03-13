@@ -7,14 +7,21 @@ import os
 import sys
 import logging
 import pickle
+import json
+import time
+import threading
+from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Literal
 
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request, Query
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 import yaml
 import uvicorn
@@ -36,7 +43,39 @@ class Config:
     def load() -> Dict[str, Any]:
         config_path = Path(__file__).parent.parent / "config.yaml"
         with open(config_path, "r") as f:
-            return yaml.safe_load(f)
+            config = yaml.safe_load(f) or {}
+
+        api_config = config.setdefault("api", {})
+        database_config = config.setdefault("database", {})
+        server_config = config.setdefault("server", {})
+
+        metalprice_key = os.environ.get("METALPRICEAPI_KEY")
+        if metalprice_key:
+            api_config["metalpriceapi_key"] = metalprice_key
+
+        database_env_map = {
+            "DATABASE_HOST": "host",
+            "DATABASE_PORT": "port",
+            "DATABASE_NAME": "name",
+            "DATABASE_USER": "user",
+            "DATABASE_PASSWORD": "password",
+        }
+        for env_name, config_key in database_env_map.items():
+            env_value = os.environ.get(env_name)
+            if env_value is not None and env_value != "":
+                database_config[config_key] = (
+                    int(env_value) if config_key == "port" else env_value
+                )
+
+        host_override = os.environ.get("SERVER_HOST")
+        if host_override:
+            server_config["host"] = host_override
+
+        port_override = os.environ.get("SERVER_PORT")
+        if port_override:
+            server_config["port"] = int(port_override)
+
+        return config
 
 
 # Initialize FastAPI
@@ -64,10 +103,79 @@ db_manager = DatabaseManager(config)
 models = {}
 models_loaded = False
 
+# Security and rate-limit settings
+API_TOKEN = os.environ.get("API_TOKEN", "")
+RATE_LIMIT_REQUESTS = int(os.environ.get("API_RATE_LIMIT_REQUESTS", "30"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("API_RATE_LIMIT_WINDOW_SECONDS", "60"))
+AUTH_EXEMPT_PATHS = {"/", "/health", "/docs", "/openapi.json", "/redoc"}
+
+security = HTTPBearer(auto_error=False)
+_rate_limit_lock = threading.Lock()
+_rate_limit_store: Dict[str, deque] = {}
+
+
+def _get_client_id(request: Request) -> str:
+    """Get a stable client identifier for rate limiting."""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "unknown"
+
+
+def enforce_rate_limit(
+    client_id: str,
+    max_requests: Optional[int] = None,
+    window_seconds: Optional[int] = None,
+) -> None:
+    """Simple in-memory rate limiter."""
+    req_limit = max_requests if max_requests is not None else RATE_LIMIT_REQUESTS
+    time_window = (
+        window_seconds if window_seconds is not None else RATE_LIMIT_WINDOW_SECONDS
+    )
+    if req_limit <= 0 or time_window <= 0:
+        return
+
+    current_time = time.time()
+
+    with _rate_limit_lock:
+        timestamps = _rate_limit_store.setdefault(client_id, deque())
+        while timestamps and timestamps[0] <= current_time - time_window:
+            timestamps.popleft()
+
+        if len(timestamps) >= req_limit:
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Please retry shortly.",
+            )
+
+        timestamps.append(current_time)
+
+
+def require_api_token(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> None:
+    """Require bearer token when API_TOKEN is configured."""
+    if request.url.path in AUTH_EXEMPT_PATHS:
+        return
+
+    if not API_TOKEN:
+        return
+
+    if not credentials or credentials.scheme.lower() != "bearer":
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+
+    if credentials.credentials != API_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid bearer token")
+
 
 # Pydantic models
 class PredictionRequest(BaseModel):
-    model_type: str = Field(
+    model_type: Literal["prophet", "arima", "lstm", "all"] = Field(
         default="all", description="Model type: prophet, arima, lstm, or all"
     )
     horizon: int = Field(default=1, ge=1, le=30, description="Forecast horizon in days")
@@ -104,6 +212,40 @@ class RetrainRequest(BaseModel):
     model_types: Optional[List[str]] = None
 
 
+class FutureForecastResponse(BaseModel):
+    model_type: str
+    horizon: int
+    dates: List[str]
+    predictions: List[float]
+    source: str = "trained_results"
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Return consistent validation error payloads."""
+    return JSONResponse(
+        status_code=422,
+        content={
+            "error": "validation_error",
+            "path": request.url.path,
+            "details": exc.errors(),
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    """Return a controlled payload for unexpected failures."""
+    logger.exception("Unhandled server error on %s: %s", request.url.path, exc)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "internal_server_error",
+            "path": request.url.path,
+        },
+    )
+
+
 def load_models() -> Dict[str, Any]:
     """Load trained models from disk"""
     global models, models_loaded
@@ -128,6 +270,62 @@ def load_models() -> Dict[str, Any]:
 
     models_loaded = True
     return models
+
+
+def load_training_results_file() -> Dict[str, Any]:
+    """Load persisted training results JSON from disk."""
+    results_path = Path(__file__).parent.parent / "training_results.json"
+    if not results_path.exists():
+        raise HTTPException(status_code=404, detail="No training results found")
+
+    with open(results_path, "r") as f:
+        return json.load(f)
+
+
+def normalize_future_forecasts(
+    forecasts_payload: Any,
+    model_type: Optional[str] = None,
+    horizon: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Normalize persisted future forecast payload into API response records."""
+    normalized: List[Dict[str, Any]] = []
+
+    if isinstance(forecasts_payload, dict):
+        for name, values in forecasts_payload.items():
+            if not isinstance(values, dict):
+                continue
+            if model_type and name != model_type:
+                continue
+
+            dates = values.get("dates", [])
+            predictions = values.get("predictions", [])
+            if not isinstance(dates, list) or not isinstance(predictions, list):
+                continue
+
+            if horizon is not None:
+                dates = dates[:horizon]
+                predictions = predictions[:horizon]
+
+            if len(dates) == 0 or len(predictions) == 0:
+                continue
+
+            clipped_horizon = min(len(dates), len(predictions))
+            try:
+                normalized.append(
+                    {
+                        "model_type": name,
+                        "horizon": clipped_horizon,
+                        "dates": [str(item) for item in dates[:clipped_horizon]],
+                        "predictions": [
+                            float(item) for item in predictions[:clipped_horizon]
+                        ],
+                        "source": "trained_results",
+                    }
+                )
+            except (TypeError, ValueError):
+                continue
+
+    return normalized
 
 
 def get_latest_data(days: int = 60) -> pd.DataFrame:
@@ -211,7 +409,11 @@ async def health_check():
 
 
 @app.post("/predict", response_model=List[PredictionResponse], tags=["Predictions"])
-async def predict(request: PredictionRequest):
+async def predict(
+    request: PredictionRequest,
+    raw_request: Request,
+    _auth: None = Depends(require_api_token),
+):
     """
     Generate price predictions
 
@@ -221,6 +423,8 @@ async def predict(request: PredictionRequest):
     Returns:
         List of predictions from requested models
     """
+    enforce_rate_limit(_get_client_id(raw_request))
+
     # Load models if not loaded
     load_models()
 
@@ -297,7 +501,12 @@ async def predict(request: PredictionRequest):
 
 
 @app.get("/predict/latest", response_model=Dict[str, Any], tags=["Predictions"])
-async def predict_latest(model_type: str = "prophet", horizon: int = 1):
+async def predict_latest(
+    raw_request: Request,
+    model_type: Literal["prophet", "arima", "lstm"] = "prophet",
+    horizon: int = 1,
+    _auth: None = Depends(require_api_token),
+):
     """
     Quick prediction endpoint
 
@@ -308,6 +517,8 @@ async def predict_latest(model_type: str = "prophet", horizon: int = 1):
     Returns:
         Predictions
     """
+    enforce_rate_limit(_get_client_id(raw_request))
+
     load_models()
 
     if model_type not in models:
@@ -341,13 +552,7 @@ async def get_metrics():
     """
     Get model performance metrics
     """
-    results_path = Path(__file__).parent.parent / "training_results.json"
-
-    if not results_path.exists():
-        raise HTTPException(status_code=404, detail="No training results found")
-
-    with open(results_path, "r") as f:
-        results = json.load(f)
+    results = load_training_results_file()
 
     metrics = results.get("metrics", {})
 
@@ -362,8 +567,44 @@ async def get_metrics():
     ]
 
 
+@app.get(
+    "/forecasts/trained",
+    response_model=List[FutureForecastResponse],
+    tags=["Predictions"],
+)
+async def get_trained_forecasts(
+    raw_request: Request,
+    model_type: Literal["all", "prophet", "arima", "lstm"] = "all",
+    horizon: Optional[int] = Query(default=None, ge=1, le=365),
+    _auth: None = Depends(require_api_token),
+):
+    """Get latest persisted future forecasts generated during model training."""
+    enforce_rate_limit(_get_client_id(raw_request))
+
+    results = load_training_results_file()
+    forecasts_payload = results.get("future_forecasts", {})
+
+    selected_model = None if model_type == "all" else model_type
+    forecasts = normalize_future_forecasts(
+        forecasts_payload, model_type=selected_model, horizon=horizon
+    )
+
+    if not forecasts:
+        raise HTTPException(
+            status_code=404,
+            detail="No trained future forecasts available. Run training first.",
+        )
+
+    return [FutureForecastResponse(**item) for item in forecasts]
+
+
 @app.post("/retrain", tags=["Model Management"])
-async def retrain_models(request: RetrainRequest, background_tasks: BackgroundTasks):
+async def retrain_models(
+    request: RetrainRequest,
+    background_tasks: BackgroundTasks,
+    raw_request: Request,
+    _auth: None = Depends(require_api_token),
+):
     """
     Trigger model retraining
 
@@ -373,7 +614,21 @@ async def retrain_models(request: RetrainRequest, background_tasks: BackgroundTa
     Returns:
         Status message
     """
+    enforce_rate_limit(_get_client_id(raw_request), max_requests=5, window_seconds=60)
+
     from src.train import run_full_pipeline
+
+    if request.model_types:
+        invalid_models = {
+            model_name
+            for model_name in request.model_types
+            if model_name not in {"prophet", "arima", "lstm"}
+        }
+        if invalid_models:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid model types: {sorted(invalid_models)}",
+            )
 
     def train_task():
         try:
@@ -404,9 +659,6 @@ async def get_latest_prices(days: int = 30):
         "prices": data["gold_price"].tolist(),
         "volumes": data.get("volume", [None] * len(data)).tolist(),
     }
-
-
-import json
 
 
 if __name__ == "__main__":

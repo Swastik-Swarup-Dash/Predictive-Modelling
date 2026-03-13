@@ -14,8 +14,11 @@ from typing import Optional, Dict, Any, List, Tuple
 import pandas as pd
 import numpy as np
 import yaml
-import mlflow
-from mlflow.tracking import MlflowClient
+
+try:
+    import mlflow  # type: ignore[import-not-found]
+except Exception:
+    mlflow = None
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -41,10 +44,33 @@ class Config:
 
     @staticmethod
     def load() -> Dict[str, Any]:
-        """Load configuration from config.yaml"""
+        """Load configuration from config.yaml with environment overrides"""
         config_path = Path(__file__).parent.parent / "config.yaml"
         with open(config_path, "r") as f:
-            return yaml.safe_load(f)
+            config = yaml.safe_load(f) or {}
+
+        api_config = config.setdefault("api", {})
+        database_config = config.setdefault("database", {})
+
+        metalprice_key = os.environ.get("METALPRICEAPI_KEY")
+        if metalprice_key:
+            api_config["metalpriceapi_key"] = metalprice_key
+
+        database_env_map = {
+            "DATABASE_HOST": "host",
+            "DATABASE_PORT": "port",
+            "DATABASE_NAME": "name",
+            "DATABASE_USER": "user",
+            "DATABASE_PASSWORD": "password",
+        }
+        for env_name, config_key in database_env_map.items():
+            env_value = os.environ.get(env_name)
+            if env_value is not None and env_value != "":
+                database_config[config_key] = (
+                    int(env_value) if config_key == "port" else env_value
+                )
+
+        return config
 
 
 class ModelTrainer:
@@ -69,6 +95,10 @@ class ModelTrainer:
 
     def setup_mlflow(self):
         """Setup MLflow tracking"""
+        if mlflow is None:
+            logger.warning("MLflow not installed; skipping MLflow setup")
+            return
+
         mlflow.set_tracking_uri(self.mlflow_uri)
         mlflow.set_experiment("gold-price-forecasting")
 
@@ -95,9 +125,15 @@ class ModelTrainer:
 
         # Fetch data
         df = fetch_all_data(start_date, end_date, csv_path)
+        self._validate_training_data(df, stage="raw")
 
-        if df.empty:
-            raise ValueError("No data fetched")
+        if not isinstance(df.index, pd.DatetimeIndex):
+            if "date" in df.columns:
+                df = df.copy()
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                df = df.dropna(subset=["date"]).set_index("date")
+            else:
+                raise ValueError("Input data must have a DatetimeIndex or a 'date' column")
 
         # Add time features
         df = self.preprocessor.add_time_features(df)
@@ -111,19 +147,86 @@ class ModelTrainer:
         # Handle remaining missing values in feature columns
         df = self.preprocessor.handle_missing_values(df)
 
+        self._validate_training_data(df, stage="processed")
+
         logger.info(f"Data prepared: {df.shape[0]} samples, {df.shape[1]} features")
 
         return df
 
-    def split_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Split data into train and test sets"""
-        train_config = self.config.get("training", {})
-        test_size = train_config.get("test_size", 0.2)
+    def _validate_training_data(self, df: pd.DataFrame, stage: str) -> None:
+        """Validate data quality before model training."""
+        if df is None or df.empty:
+            raise ValueError(f"No data available at '{stage}' stage")
 
-        split_idx = int(len(df) * (1 - test_size))
+        if "gold_price" not in df.columns:
+            raise ValueError("Required column 'gold_price' not found in dataset")
+
+        train_config = self.config.get("training", {})
+        min_samples = int(train_config.get("min_samples", 365))
+        if len(df) < min_samples:
+            raise ValueError(
+                f"Insufficient samples for training: {len(df)} < {min_samples}"
+            )
+
+        if df["gold_price"].isna().all():
+            raise ValueError("Column 'gold_price' contains only missing values")
+
+        missing_ratio = float(df["gold_price"].isna().mean())
+        max_missing_ratio = float(train_config.get("max_missing_ratio", 0.05))
+        if missing_ratio > max_missing_ratio:
+            raise ValueError(
+                f"Too many missing values in 'gold_price': {missing_ratio:.2%} > {max_missing_ratio:.2%}"
+            )
+
+    def split_data(
+        self, df: pd.DataFrame, include_validation: bool = False
+    ) -> Tuple[pd.DataFrame, ...]:
+        """Split data into train/test or train/validation/test sets."""
+        self._validate_training_data(df, stage="split")
+
+        train_config = self.config.get("training", {})
+        test_size = float(train_config.get("test_size", 0.2))
+        validation_size = float(train_config.get("validation_size", 0.1))
+
+        if not 0 < test_size < 1:
+            raise ValueError("training.test_size must be between 0 and 1")
+        if not 0 <= validation_size < 1:
+            raise ValueError("training.validation_size must be in [0, 1)")
+
+        if include_validation and (test_size + validation_size >= 1):
+            raise ValueError(
+                "training.test_size + training.validation_size must be < 1"
+            )
+
+        n_rows = len(df)
+        test_rows = max(1, int(round(n_rows * test_size)))
+        split_idx = n_rows - test_rows
 
         train_df = df.iloc[:split_idx]
         test_df = df.iloc[split_idx:]
+
+        if include_validation:
+            val_rows = max(1, int(round(n_rows * validation_size)))
+            train_end = n_rows - (test_rows + val_rows)
+            train_end = max(1, train_end)
+            val_end = train_end + val_rows
+
+            train_df = df.iloc[:train_end]
+            val_df = df.iloc[train_end:val_end]
+            test_df = df.iloc[val_end:]
+
+            if train_df.empty or val_df.empty or test_df.empty:
+                raise ValueError(
+                    "Data split produced an empty partition. Adjust test/validation sizes."
+                )
+
+            logger.info(
+                f"Train: {len(train_df)}, Validation: {len(val_df)}, Test: {len(test_df)}"
+            )
+            return train_df, val_df, test_df
+
+        if train_df.empty or test_df.empty:
+            raise ValueError("Data split produced an empty train or test partition")
 
         logger.info(f"Train: {len(train_df)}, Test: {len(test_df)}")
 
@@ -134,6 +237,8 @@ class ModelTrainer:
         model_type: str,
         train_df: pd.DataFrame,
         test_df: pd.DataFrame,
+        full_history_df: Optional[pd.DataFrame] = None,
+        forecast_horizon: Optional[int] = None,
         use_mlflow: bool = True,
     ) -> Dict[str, Any]:
         """
@@ -152,6 +257,9 @@ class ModelTrainer:
 
         # Skip mlflow for now to avoid segfault
         use_mlflow = False
+        forecast_horizon = forecast_horizon or int(
+            self.config.get("forecast", {}).get("horizon", 30)
+        )
 
         try:
             # Create model
@@ -207,10 +315,39 @@ class ModelTrainer:
 
                 mlflow.end_run()
 
+            history_df = full_history_df if full_history_df is not None else pd.concat(
+                [train_df, test_df]
+            )
+            history_df = history_df.sort_index()
+
+            future_forecast = self._generate_future_forecast(
+                model_type=model_type,
+                base_model=model,
+                history_df=history_df,
+                horizon=forecast_horizon,
+            )
+
+            model_to_save = model
+
+            if model_type == "lstm" and not history_df.empty:
+                logger.info(
+                    "Retraining LSTM on full historical values for future forecasting..."
+                )
+                model_to_save = ModelFactory.create(model_type, self.config)
+                model_to_save.fit(history_df)
+
+                future_forecast = self._generate_future_forecast(
+                    model_type=model_type,
+                    base_model=model_to_save,
+                    history_df=history_df,
+                    horizon=forecast_horizon,
+                )
+
             return {
-                "model": model,
+                "model": model_to_save,
                 "metrics": metrics,
                 "predictions": predictions.tolist(),
+                "future_forecast": future_forecast,
             }
 
         except Exception as e:
@@ -218,6 +355,50 @@ class ModelTrainer:
             if use_mlflow:
                 mlflow.end_run(status="FAILED")
             raise
+
+    @staticmethod
+    def _build_future_dates(last_date: pd.Timestamp, horizon: int) -> List[str]:
+        """Build future daily date strings from the last observed date."""
+        start_date = pd.to_datetime(last_date) + pd.Timedelta(days=1)
+        return pd.date_range(start=start_date, periods=horizon, freq="D").strftime(
+            "%Y-%m-%d"
+        ).tolist()
+
+    def _generate_future_forecast(
+        self,
+        model_type: str,
+        base_model: Any,
+        history_df: pd.DataFrame,
+        horizon: int,
+    ) -> Dict[str, Any]:
+        """Generate future forecast payload for a trained model."""
+        if history_df.empty:
+            return {
+                "model_type": model_type,
+                "horizon": horizon,
+                "dates": [],
+                "predictions": [],
+            }
+
+        last_date = pd.to_datetime(history_df.index.max())
+        future_dates = self._build_future_dates(last_date, horizon)
+
+        if model_type == "lstm":
+            future_predictions = base_model.predict_multiple(history_df, horizon)
+        else:
+            future_predictions = base_model.predict(horizon)
+
+        if not isinstance(future_predictions, np.ndarray):
+            future_predictions = np.array(future_predictions)
+
+        future_predictions = future_predictions[:horizon]
+
+        return {
+            "model_type": model_type,
+            "horizon": horizon,
+            "dates": future_dates,
+            "predictions": future_predictions.tolist(),
+        }
 
     def train_all_models(
         self,
@@ -243,18 +424,31 @@ class ModelTrainer:
             "models": {},
             "metrics": {},
             "predictions": {},
+            "future_forecasts": {},
             "best_model": None,
             "best_mape": float("inf"),
         }
 
+        forecast_horizon = int(self.config.get("forecast", {}).get("horizon", 30))
+        full_history_df = pd.concat([train_df, test_df]).sort_index()
+
         for model_type in model_types:
             result = None
             try:
-                result = self.train_model(model_type, train_df, test_df)
+                result = self.train_model(
+                    model_type,
+                    train_df,
+                    test_df,
+                    full_history_df=full_history_df,
+                    forecast_horizon=forecast_horizon,
+                )
 
                 results["models"][model_type] = result["model"]
                 results["metrics"][model_type] = result["metrics"]
                 results["predictions"][model_type] = result["predictions"]
+                results["future_forecasts"][model_type] = result.get(
+                    "future_forecast", {}
+                )
 
                 # Track best model
                 if result["metrics"]["mape"] < results["best_mape"]:
@@ -387,6 +581,7 @@ class ModelTrainer:
         serializable_results = {
             "timestamp": datetime.now().isoformat(),
             "metrics": results.get("metrics", {}),
+            "future_forecasts": results.get("future_forecasts", {}),
             "best_model": results.get("best_model"),
             "best_mape": results.get("best_mape"),
         }
